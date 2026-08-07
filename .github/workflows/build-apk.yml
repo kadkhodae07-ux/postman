@@ -1,0 +1,402 @@
+name: Build Post Management APK v40
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "**.zip"
+      - "pubspec.yaml"
+      - "lib/**"
+      - "android/**"
+      - ".github/workflows/build-apk.yml"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: post-management-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find Flutter project
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "pubspec.yaml" ]; then
+            echo "PROJECT_DIR=$PWD" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          ZIP_FILE=""
+          while IFS= read -r candidate; do
+            if unzip -Z1 "$candidate" 2>/dev/null | grep -qE '(^|/)pubspec\.yaml$'; then
+              ZIP_FILE="$candidate"
+              break
+            fi
+          done < <(find . -maxdepth 1 -type f -name '*.zip' -printf '%T@ %p\n' | sort -nr | cut -d' ' -f2-)
+          if [ -z "$ZIP_FILE" ]; then
+            echo "No ZIP containing a Flutter pubspec.yaml was found."
+            exit 1
+          fi
+          echo "Using newest Flutter ZIP: $ZIP_FILE"
+          rm -rf _extracted_flutter
+          mkdir -p _extracted_flutter
+          unzip -q "$ZIP_FILE" -d _extracted_flutter
+
+          PUBSPEC="$(find _extracted_flutter -type f -name pubspec.yaml -print -quit || true)"
+          if [ -z "$PUBSPEC" ]; then
+            echo "pubspec.yaml was not found inside ZIP."
+            find _extracted_flutter -maxdepth 4 -type f | head -n 120 || true
+            exit 1
+          fi
+          PROJECT_DIR="$(dirname "$PUBSPEC")"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Flutter project: $PROJECT_DIR"
+          echo "find_flutter_project=ok" >> "$RUNNER_TEMP/post-workflow-stages.log"
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter 3.24.5
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.24.5"
+          channel: stable
+          cache: true
+
+      - name: Verify preinstalled Android SDK 35
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID SDK ROOT: $SDK_ROOT"
+          echo "Installed Android platforms:"
+          ls -1 "$SDK_ROOT/platforms" || true
+          if [ ! -f "$SDK_ROOT/platforms/android-35/android.jar" ]; then
+            echo "::error::android-35 is not preinstalled on this runner image."
+            echo "::error::Expected: $SDK_ROOT/platforms/android-35/android.jar"
+            exit 1
+          fi
+          echo "android-35 is available; no sdkmanager install or license mutation is required."
+          echo "verify_android_sdk_35=ok" >> "$RUNNER_TEMP/post-workflow-stages.log"
+
+      - name: Prepare Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          HAD_TEST_DIR=0
+          if [ -d "test" ]; then
+            HAD_TEST_DIR=1
+          fi
+
+          if [ ! -f "android/app/build.gradle" ] && [ ! -f "android/app/build.gradle.kts" ]; then
+            flutter create --platforms=android --org ir.postmanagement --project-name post_management_sms_flutter .
+          fi
+
+          # flutter create generates a default widget_test.dart that targets MyApp.
+          # This source intentionally ships without tests, so remove only tests created by flutter create.
+          if [ "$HAD_TEST_DIR" -eq 0 ]; then
+            rm -rf test
+          fi
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          manifest = Path('android/app/src/main/AndroidManifest.xml')
+          if not manifest.exists():
+              raise SystemExit('AndroidManifest.xml not found')
+          text = manifest.read_text()
+          permissions = [
+              'android.permission.INTERNET',
+              'android.permission.READ_CONTACTS',
+              'android.permission.WRITE_CONTACTS',
+              'android.permission.RECEIVE_SMS',
+          ]
+          for perm in permissions:
+              if f'android:name="{perm}"' not in text:
+                  text = re.sub(r'(<manifest[^>]*>)', r'\1\n    <uses-permission android:name="'+perm+r'" />', text, count=1)
+
+          text = re.sub(r'<application\b([^>]*)>', lambda m: '<application'+(
+              m.group(1)
+              if 'android:allowBackup=' in m.group(1)
+              else m.group(1)+' android:allowBackup="false"'
+          )+'>', text, count=1)
+          if 'android:usesCleartextTraffic=' not in text:
+              text = re.sub(r'<application\b([^>]*)>', r'<application\1 android:usesCleartextTraffic="false">', text, count=1)
+
+          receiver = '''\n        <receiver\n            android:name="com.shounakmulay.telephony.sms.IncomingSmsReceiver"\n            android:permission="android.permission.BROADCAST_SMS"\n            android:exported="true">\n            <intent-filter>\n                <action android:name="android.provider.Telephony.SMS_RECEIVED" />\n            </intent-filter>\n        </receiver>\n'''
+          if 'com.shounakmulay.telephony.sms.IncomingSmsReceiver' not in text:
+              text = text.replace('</application>', receiver+'    </application>')
+          manifest.write_text(text)
+
+          proguard = Path('android/app/proguard-rules.pro')
+          rules = proguard.read_text() if proguard.exists() else ''
+          required_rules = '''
+          # google_mlkit_text_recognition supports optional scripts that are not bundled.
+          # The app uses only TextRecognitionScript.latin, so these optional classes are intentionally absent.
+          -dontwarn com.google.mlkit.vision.text.chinese.**
+          -dontwarn com.google.mlkit.vision.text.devanagari.**
+          -dontwarn com.google.mlkit.vision.text.japanese.**
+          -dontwarn com.google.mlkit.vision.text.korean.**
+          '''
+          if 'com.google.mlkit.vision.text.chinese' not in rules:
+              rules = (rules.rstrip() + '\n' + required_rules.strip() + '\n').lstrip()
+          proguard.write_text(rules)
+
+          for gradle in [Path('android/app/build.gradle'), Path('android/app/build.gradle.kts')]:
+              if not gradle.exists():
+                  continue
+              g = gradle.read_text()
+
+              # Plugins used by this project require compileSdk 35.
+              g = re.sub(r'compileSdkVersion\s+flutter\.compileSdkVersion', 'compileSdkVersion 35', g)
+              g = re.sub(r'compileSdkVersion\s+\d+', 'compileSdkVersion 35', g)
+              g = re.sub(r'compileSdk\s*=\s*flutter\.compileSdkVersion', 'compileSdk = 35', g)
+              g = re.sub(r'compileSdk\s*=\s*flutter\.compileSdk', 'compileSdk = 35', g)
+              g = re.sub(r'compileSdk\s*=\s*\d+', 'compileSdk = 35', g)
+
+              g = re.sub(r'minSdkVersion\s+flutter\.minSdkVersion', 'minSdkVersion 23', g)
+              g = re.sub(r'minSdk\s*=\s*flutter\.minSdkVersion', 'minSdk = 23', g)
+              g = re.sub(r'minSdk\s*=\s*flutter\.minSdk', 'minSdk = 23', g)
+
+              if gradle.name == 'build.gradle':
+                  # Make our R8 rules effective for release builds.
+                  if "'proguard-rules.pro'" not in g and '"proguard-rules.pro"' not in g:
+                      marker = '    buildTypes {'
+                      if marker not in g:
+                          raise SystemExit('Groovy buildTypes block not found')
+                      # Inject inside release block when present.
+                      release_pat = r'(release\s*\{)'
+                      if re.search(release_pat, g):
+                          g = re.sub(
+                              release_pat,
+                              r"\1\n            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'",
+                              g,
+                              count=1,
+                          )
+                      else:
+                          raise SystemExit('Groovy release buildType not found')
+              else:
+                  if '"proguard-rules.pro"' not in g:
+                      release_pat = r'(getByName\("release"\)\s*\{)'
+                      create_pat = r'(release\s*\{)'
+                      if re.search(release_pat, g):
+                          g = re.sub(
+                              release_pat,
+                              r'\1\n            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")',
+                              g,
+                              count=1,
+                          )
+                      elif re.search(create_pat, g):
+                          g = re.sub(
+                              create_pat,
+                              r'\1\n            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")',
+                              g,
+                              count=1,
+                          )
+                      else:
+                          raise SystemExit('Kotlin release buildType not found')
+
+              gradle.write_text(g)
+          PY
+
+          echo "Prepared manifest:"
+          grep -E "uses-permission|IncomingSmsReceiver|allowBackup|usesCleartextTraffic" android/app/src/main/AndroidManifest.xml || true
+          echo "Prepared Android SDK / R8 configuration:"
+          grep -R -E "compileSdk|proguardFiles" android/app/build.gradle* || true
+          cat android/app/proguard-rules.pro || true
+          echo "prepare_android=ok" >> "$RUNNER_TEMP/post-workflow-stages.log"
+
+      - name: Configure optional release signing
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          if [ -z "${ANDROID_KEYSTORE_BASE64:-}" ] || [ -z "${ANDROID_KEYSTORE_PASSWORD:-}" ] || [ -z "${ANDROID_KEY_PASSWORD:-}" ] || [ -z "${ANDROID_KEY_ALIAS:-}" ]; then
+            echo "Stable release-signing secrets are not all configured; using the Flutter project's existing signing configuration."
+            exit 0
+          fi
+
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/app/upload-keystore.jks
+          cat > android/key.properties <<EOF
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyPassword=$ANDROID_KEY_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          storeFile=upload-keystore.jks
+          EOF
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          groovy=Path('android/app/build.gradle')
+          kotlin=Path('android/app/build.gradle.kts')
+          if groovy.exists():
+              s=groovy.read_text()
+              if "keyProperties = new Properties()" not in s:
+                  prefix="""def keyProperties = new Properties()\ndef keyPropertiesFile = rootProject.file('key.properties')\nif (keyPropertiesFile.exists()) {\n    keyProperties.load(new FileInputStream(keyPropertiesFile))\n}\n\n"""
+                  s=prefix+s
+              if 'signingConfigs {' not in s:
+                  marker='    buildTypes {'
+                  block="""    signingConfigs {\n        release {\n            keyAlias keyProperties['keyAlias']\n            keyPassword keyProperties['keyPassword']\n            storeFile keyProperties['storeFile'] ? file(keyProperties['storeFile']) : null\n            storePassword keyProperties['storePassword']\n        }\n    }\n\n"""
+                  if marker not in s: raise SystemExit('Groovy buildTypes block not found')
+                  s=s.replace(marker,block+marker,1)
+              s=s.replace('signingConfig signingConfigs.debug','signingConfig signingConfigs.release')
+              groovy.write_text(s)
+          elif kotlin.exists():
+              s=kotlin.read_text()
+              if 'val keyProperties = Properties()' not in s:
+                  prefix="""import java.util.Properties\nimport java.io.FileInputStream\n\nval keyProperties = Properties()\nval keyPropertiesFile = rootProject.file("key.properties")\nif (keyPropertiesFile.exists()) {\n    keyProperties.load(FileInputStream(keyPropertiesFile))\n}\n\n"""
+                  s=prefix+s
+              if 'create("release")' not in s:
+                  marker='    buildTypes {'
+                  block="""    signingConfigs {\n        create("release") {\n            keyAlias = keyProperties["keyAlias"] as String?\n            keyPassword = keyProperties["keyPassword"] as String?\n            storeFile = keyProperties["storeFile"]?.let { file(it) }\n            storePassword = keyProperties["storePassword"] as String?\n        }\n    }\n\n"""
+                  if marker not in s: raise SystemExit('Kotlin buildTypes block not found')
+                  s=s.replace(marker,block+marker,1)
+              s=s.replace('signingConfig = signingConfigs.getByName("debug")','signingConfig = signingConfigs.getByName("release")')
+              kotlin.write_text(s)
+          else:
+              raise SystemExit('Android app Gradle file not found')
+          PY
+
+      - name: Flutter doctor
+        shell: bash
+        run: flutter doctor -v
+
+      - name: Flutter pub get
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter pub get 2>&1 | tee "$RUNNER_TEMP/flutter-pub-get.log"
+          echo "flutter_pub_get=ok" >> "$RUNNER_TEMP/post-workflow-stages.log"
+
+      - name: Analyze source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter analyze --no-fatal-infos 2>&1 | tee "$RUNNER_TEMP/flutter-analyze.log"
+          echo "flutter_analyze=ok" >> "$RUNNER_TEMP/post-workflow-stages.log"
+
+      - name: Build release APK
+        shell: bash
+        env:
+          GRADLE_OPTS: "-Dorg.gradle.vfs.watch=false"
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter clean
+          flutter pub get
+          flutter build apk --release --no-tree-shake-icons 2>&1 | tee "$RUNNER_TEMP/flutter-build.log"
+          echo "flutter_build_release=ok" >> "$RUNNER_TEMP/post-workflow-stages.log"
+
+      - name: Collect exactly one APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf output_apk
+          mkdir -p output_apk
+          APK_PATH="$PROJECT_DIR/build/app/outputs/flutter-apk/app-release.apk"
+          if [ ! -f "$APK_PATH" ]; then
+            APK_PATH="$(find "$PROJECT_DIR/build/app/outputs/flutter-apk" -maxdepth 1 -type f -name '*.apk' -print -quit || true)"
+          fi
+          if [ -z "$APK_PATH" ] || [ ! -f "$APK_PATH" ]; then
+            echo "APK not found."
+            find "$PROJECT_DIR/build" -type f | head -n 150 || true
+            exit 1
+          fi
+          cp "$APK_PATH" output_apk/post-management-v40.apk
+          test "$(find output_apk -type f -name '*.apk' | wc -l)" -eq 1
+          sha256sum output_apk/post-management-v40.apk | tee output_apk/SHA256.txt
+          ls -lh output_apk/post-management-v40.apk
+
+      - name: Upload APK
+        id: upload_apk
+        uses: actions/upload-artifact@v4
+        with:
+          name: post-management-apk
+          path: output_apk/post-management-v40.apk
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Delete previous successful APK artifacts
+        if: success()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_ARTIFACT_ID: ${{ steps.upload_apk.outputs.artifact-id }}
+        run: |
+          set -uo pipefail
+          IDS="$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name=="post-management-apk") | .id' 2>/dev/null || true)"
+          while IFS= read -r artifact_id; do
+            [ -z "$artifact_id" ] && continue
+            [ "$artifact_id" = "${CURRENT_ARTIFACT_ID:-}" ] && continue
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" >/dev/null 2>&1 || true
+          done <<< "$IDS"
+
+      - name: Collect failure logs
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+          mkdir -p failure_logs
+          cp "$RUNNER_TEMP"/flutter-*.log failure_logs/ 2>/dev/null || true
+          cp "$RUNNER_TEMP/post-workflow-stages.log" failure_logs/workflow-stages.txt 2>/dev/null || true
+          {
+            echo "ANDROID_HOME=${ANDROID_HOME:-}"
+            echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-}"
+            SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+            echo "SDK_ROOT=$SDK_ROOT"
+            echo "--- platforms ---"
+            ls -la "$SDK_ROOT/platforms" 2>&1 || true
+            echo "--- build-tools ---"
+            ls -la "$SDK_ROOT/build-tools" 2>&1 || true
+          } > failure_logs/android-sdk.txt 2>&1 || true
+          if [ -n "${PROJECT_DIR:-}" ] && [ -d "${PROJECT_DIR:-}" ]; then
+            (cd "$PROJECT_DIR" && flutter doctor -v) > failure_logs/flutter-doctor.txt 2>&1 || true
+            find "$PROJECT_DIR" -maxdepth 5 -type f \( -name 'pubspec.yaml' -o -name 'build.gradle' -o -name 'build.gradle.kts' -o -name 'AndroidManifest.xml' -o -name 'proguard-rules.pro' \) -print > failure_logs/project-files.txt 2>&1 || true
+            if [ -f "$PROJECT_DIR/android/app/build.gradle" ]; then
+              cp "$PROJECT_DIR/android/app/build.gradle" failure_logs/app-build.gradle 2>/dev/null || true
+            fi
+            if [ -f "$PROJECT_DIR/android/app/build.gradle.kts" ]; then
+              cp "$PROJECT_DIR/android/app/build.gradle.kts" failure_logs/app-build.gradle.kts 2>/dev/null || true
+            fi
+            if [ -f "$PROJECT_DIR/android/app/proguard-rules.pro" ]; then
+              cp "$PROJECT_DIR/android/app/proguard-rules.pro" failure_logs/proguard-rules.pro 2>/dev/null || true
+            fi
+            if [ -f "$PROJECT_DIR/build/app/outputs/mapping/release/missing_rules.txt" ]; then
+              cp "$PROJECT_DIR/build/app/outputs/mapping/release/missing_rules.txt" failure_logs/missing_rules.txt 2>/dev/null || true
+            fi
+          fi
+
+      - name: Upload failure logs only on error
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: post-management-failure-logs
+          path: failure_logs
+          if-no-files-found: warn
+          retention-days: 3
